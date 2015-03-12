@@ -272,7 +272,7 @@ def extract_test_set(data, num_test=3):
     return test
 
 
-def load_jester_data(fname='jester-data-all.csv', nrows=1000):
+def load_jester_data(fname='data/jester-data-all.csv', nrows=1000):
     data = pd.read_csv(fname, index_col=0, header=False, nrows=nrows)
     data += 10  # ratings are from -10 to 10, lets make them 0 to 20
     test = extract_test_set(data)
