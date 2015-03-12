@@ -4,6 +4,13 @@ import pandas as pd
 import numpy as np
 
 
+def matrix_approx(U, M, low=0, high=20):
+    A = np.dot(U.T, M)
+    A[A < low] = low
+    A[A > high] = high
+    return A
+
+
 def batch_svd(train_data, learn_rate=0.00001, regc_u=0.015, regc_m=0.015,
               low=0, high=20, dim=50, momentum=0.9, threshold=0.001,
               debug=False):
@@ -40,9 +47,10 @@ def batch_svd(train_data, learn_rate=0.00001, regc_u=0.015, regc_m=0.015,
     rmse = np.sqrt(mse)
     rmse_record = [rmse]
     improvement = 1
+    iterations = 0
 
     # for _ in xrange(iterations):
-    while improvement >= threshold:
+    while iterations < 10 or improvement >= threshold:
 
         # update momentums
         u_mom = momentum * u_mom
@@ -68,6 +76,7 @@ def batch_svd(train_data, learn_rate=0.00001, regc_u=0.015, regc_m=0.015,
         rmse =  np.sqrt(mse)
         improvement = rmse_record[-1] - rmse
         rmse_record.append(rmse)
+        iterations += 1
 
     if debug:
         return U, M, rmse_record
@@ -160,6 +169,7 @@ def biased_incremental_svd(train_data, learn_rate=0.0025, regc_u=0.02,
     Terminates when an update fails to improve RMSE by `threshold`, which
     defaults to 0.001.
     """
+    # TODO: incorporate global mean as global bias, in learning and prediction.
 
     # compute indicator for training data
     I = train_data.copy()
@@ -230,9 +240,9 @@ def biased_incremental_svd(train_data, learn_rate=0.0025, regc_u=0.02,
         rmse_record.append(rmse)
 
     if debug:
-        return U, M, rmse_record
+        return U, M, a, b, rmse_record
     else:
-        return U, M
+        return U, M, a, b
 
 
 def rmse(actual, predicted, low=0):
@@ -287,9 +297,7 @@ def test_batch_svd(nrows=1000):
                                   threshold=0.0001, debug=True)
     elapsed = time.time() - start
 
-    A = np.dot(U.T, M)
-    A[A < 0] = 0
-    A[A > 20] = 20
+    A = matrix_approx(U, M, 0, 20)
     print "Batch SVD: %.5f (%.3fs)" % (
         rmse(test, A, low=0), elapsed)
 
@@ -302,9 +310,7 @@ def test_incremental_svd(nrows=1000):
         train, learn_rate=0.0025, dim=80, threshold=0.001, debug=True)
     elapsed = time.time() - start
 
-    A = np.dot(U.T, M)
-    A[A < 0] = 0
-    A[A > 20] = 20
+    A = matrix_approx(U, M, 0, 20)
     print "Incremental SVD: %.5f (%.3fs)" % (
         rmse(test, A, low=0), elapsed)
 
@@ -313,13 +319,14 @@ def test_biased_incremental_svd(nrows=1000):
     train, test = load_jester_data(nrows=nrows)
     # these parameters were tuned through a number of test runs
     start = time.time()
-    U, M, rmse_record = biased_incremental_svd(
+    U, M, a, b, rmse_record = biased_incremental_svd(
         train, learn_rate=0.0025, dim=80, threshold=0.001, debug=True)
     elapsed = time.time() - start
 
-    A = np.dot(U.T, M)
-    A[A < 0] = 0
-    A[A > 20] = 20
+    dims = (len(a), len(b))
+    A = matrix_approx(U, M, low=0, high=20)
+    A += (np.repeat(a,len(b)).reshape(dims) +
+          np.repeat(b, len(a)).reshape(dims, order='F'))
     print "Biased Incremental SVD: %.5f (%.3fs)" % (
         rmse(test, A, low=0), elapsed)
 
