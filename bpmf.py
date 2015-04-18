@@ -24,43 +24,24 @@ def gen_data(n=50, m=20):
     pass
 
 
-def rmse(data, predicted):
-    """Calculate root mean squared error."""
-    I = ~np.isnan(data)   # indicator for missing values
-    N = I.sum()           # number of non-missing values
-    sqerror = abs(data - predicted) ** 2
+def rmse(test_data, predicted):
+    """Calculate root mean squared error, ignoring missing values in the test
+    data."""
+    I = ~np.isnan(test_data)   # indicator for missing values
+    N = I.sum()                # number of non-missing values
+    sqerror = abs(test_data - predicted) ** 2
     mse = sqerror[I].sum() / N
     return np.sqrt(mse)
 
 
-class PMF(object):
-    """Probabilistic Matrix Factorization"""
+class Model(object):
+    """Base class for PyMC model wrappers."""
 
-    def __init__(self, data, scale, alpha=2, dim=10):
-        """
-        :param numpy.ndarray data: Observed data to learn the model from.
-        :param int alpha: Precision for all observed data.
-        :param int dim: Dimensionality, or number of latent factors to learn.
-        """
-        self.data = data
-        self.scale = scale
-        self.dim = dim
-
-        # Set precision of U and V according to sample precision.
-        self.sample_precision = 1 / np.var(data)
-        self.alpha_u = self.alpha_v = self.sample_precision * np.eye(dim)
-
-        # Use fixed precision for the likelihood function.
-        self.alpha = np.ones(self.data.shape) * alpha
-
+    def __init__(self):
         # Set None values for attributes to be set later
         self.step = None
         self.trace = None
         self.predicted = None
-
-    @property
-    def std(self):
-        return np.sqrt(1 / self.alpha[0,0])
 
     @property
     def model(self):
@@ -69,6 +50,70 @@ class PMF(object):
         except:
             self.build_model()
             return self._model
+
+    def build_model(self):
+        raise NotImplementedError()
+
+    @property
+    def map(self):
+        try:
+            return self._map
+        except:
+            self.find_map()
+            return self._map
+
+    def find_map(self):
+        """Use non-gradient based optimization to find MAP."""
+        with self.model:
+            logging.info('finding MAP using Powell optimization')
+            self._map = pm.find_MAP(fmin=sp.optimize.fmin_powell)
+
+    @property
+    def start(self):
+        return self.map
+
+    def sample(self, n=100, njobs=4, progressbar=True):
+        """Draw n MCMC samples using the NUTS sampler."""
+        with self.model:
+            logging.info(
+                'drawing %d MCMC samples using %d jobs' % (n, njobs))
+            self.step = pm.NUTS(scaling=self.start)
+            self.trace = pm.sample(n, self.step, start=self.start, njobs=njobs,
+                                   progressbar=progressbar)
+
+    def rmse(self, test_data):
+        """Find root mean squared error on this model's predictions."""
+        return rmse(test_data, self.predicted)
+
+
+class PMF(Model):
+    """Probabilistic Matrix Factorization"""
+
+    def __init__(self, data, scale, alpha=2, dim=10):
+        """
+        :param numpy.ndarray data: Observed data to learn the model from.
+        :param int alpha: Precision for all observed data.
+        :param int dim: Dimensionality, or number of latent factors to learn.
+        """
+        super(PMF, self).__init__()
+        self.scale = scale
+        self.dim = dim
+        self.data = data.copy()
+
+        # Mean value imputation
+        nan_mask = np.isnan(self.data)
+        self.data[nan_mask] = self.data[~nan_mask].mean()
+
+        # Set precision of U and V according to sample precision.
+        self.sample_precision = 1 / np.var(self.data)
+        self.alpha_u = self.alpha_v = self.sample_precision * np.eye(dim)
+
+        # Use fixed precision for the likelihood function.
+        self.alpha = np.ones(self.data.shape) * alpha
+
+    @property
+    def std(self):
+        return np.sqrt(1 / self.alpha[0,0])
 
     def build_model(self):
         """Construct the model using pymc3 (most of the work is done by theano).
@@ -93,29 +138,6 @@ class PMF(object):
         logging.info('done building PMF model')
         self._model = pmf
 
-    @property
-    def map(self):
-        try:
-            return self._map
-        except:
-            self.find_map()
-            return self._map
-
-    def find_map(self):
-        """Use non-gradient based optimization to find MAP."""
-        with self.model:
-            logging.info('finding MAP using Powell optimization')
-            self._map = pm.find_MAP(fmin=sp.optimize.fmin_powell)
-
-    def sample(self, n=100, njobs=4, progressbar=True):
-        """Draw n MCMC samples using the NUTS sampler."""
-        with self.model:
-            logging.info(
-                'drawing %d MCMC samples using %d jobs' % (n, njobs))
-            self.step = pm.NUTS(scaling=self.map)
-            self.trace = pm.sample(n, self.step, start=self.map, njobs=njobs,
-                                   progressbar=progressbar)
-
     def estimate_R(self, U, V):
         R = np.dot(U, V.T)
         n, m = R.shape
@@ -134,6 +156,10 @@ class PMF(object):
         return rmse(test_data, sample_R)
 
     def predict(self, burn_in=0):
+        """Fill in missing values in data using MCMC samples to approximate the
+        posterior distribution. Discard `burn_in` samples and use the rest.
+        Cache the predictions on the object and also return them.
+        """
         self.predicted = np.ndarray(self.data.shape)
         for sample in self.trace[burn_in:]:
             self.predicted += self.estimate_R(sample['U'], sample['V'])
@@ -142,9 +168,124 @@ class PMF(object):
         low, high = self.scale
         self.predicted[self.predicted < low] = low
         self.predicted[self.predicted > high] = high
+        return self.predicted
 
-    def rmse(self, test_data):
-        return rmse(test_data, self.predicted)
+    def running_rmse(self, test_data, burn_in=10):
+        """Calculate RMSE for each step of the trace to monitor convergence.
+        Return a list of tuples with the first element being the per-sample
+        RMSE, and the last being the running RMSE.
+        """
+        burn_in = burn_in if len(self.trace) >= burn_in else 0
+        results = []
+        R = np.zeros(self.data.shape)
+        for cnt, sample in enumerate(self.trace[burn_in:]):
+            sample_R = self.estimate_R(sample['U'], sample['V'])
+            R += sample_R
+            running_R = R / (cnt + 1)
+            results.append((rmse(test_data, sample_R),
+                            rmse(test_data, running_R)))
+        return results
+
+    def _norms(self, ord, monitor):
+        norms = {var: [] for var in monitor}
+        for sample in self.trace:
+            for var in monitor:
+                norms[var].append(np.linalg.norm(sample[var], ord))
+        return norms
+
+    def norms(self, ord='fro'):
+        """Return norms of latent variables. These can be used to monitor
+        convergence of the sampler.
+        """
+        monitor = ('U', 'V')
+        return self._norms(ord, monitor)
+
+
+class BPMF(PMF):
+    """Bayesian Probabilistic Matrix Factorization"""
+
+    def __init__(self, data, scale, alpha=2, dim=10):
+        """
+        :param numpy.ndarray data: Observed data to learn the model from.
+        :param (tuple of int) scale: scale of user preferences (R).
+        :param int dim: Dimensionality, or number of latent factors to learn.
+        """
+        super(BPMF, self).__init__(data, scale, alpha, dim)
+
+        # BPMF uses hyperpriors to learn the precision vectors.
+        del self.__dict__['alpha_u']
+        del self.__dict__['alpha_v']
+
+    def build_model(self):
+        n, m = self.data.shape
+        dim = self.dim
+        beta_0 = 1  # scaling factor for lambdas; unclear on its use
+
+        logging.info('building the BPMF model')
+        std = .05  # how much noise to use for model initialization
+        with pm.Model() as bpmf:
+            # Specify user feature matrix
+            lambda_u = pm.Wishart(
+                'lambda_u', n=dim, V=np.eye(dim), shape=(dim, dim),
+                testval=np.random.randn(dim, dim) * std)
+            mu_u = pm.Normal(
+                'mu_u', mu=0, tau=beta_0 * lambda_u, shape=dim,
+                 testval=np.random.randn(dim) * std)
+            U = pm.MvNormal(
+                'U', mu=mu_u, tau=lambda_u, shape=(n, dim),
+                testval=np.random.randn(n, dim) * std)
+
+            # Specify item feature matrix
+            lambda_v = pm.Wishart(
+                'lambda_v', n=dim, V=np.eye(dim), shape=(dim, dim),
+                testval=np.random.randn(dim, dim) * std)
+            mu_v = pm.Normal(
+                'mu_v', mu=0, tau=beta_0 * lambda_v, shape=dim,
+                 testval=np.random.randn(dim) * std)
+            V = pm.MvNormal(
+                'V', mu=mu_v, tau=lambda_v, shape=(m, dim),
+                testval=np.random.randn(m, dim) * std)
+
+            # Specify rating likelihood function
+            R = pm.Normal(
+                'R', mu=theano.tensor.dot(U, V.T), tau=self.alpha,
+                observed=self.data)
+
+        logging.info('done building the BPMF model')
+        self._model = bpmf
+
+    def find_map(self):
+        """Use the PMF map to initialize BPMF."""
+        logging.info("Using PMF MAP to initialize BPMF")
+        pmf = PMF(self.data, self.scale, dim=self.dim)
+        self._map = pmf.map
+
+    @property
+    def start(self):
+        """Initialization values for the sampler."""
+        start = self.map
+        point = self.model.test_point
+        for key in point:
+            if key not in start:
+                start[key] = point[key]
+        return start
+
+    def _norms(self, ord, monitor):
+        logging.info('calculating %s norms for model vars: %s' % (
+            ord, ','.join(monitor)))
+
+        norms = {var: [] for var in monitor}
+        for sample in self.trace:
+            for var in monitor:
+                norms[var].append(np.linalg.norm(sample[var], ord))
+        return norms
+
+    def norms(self, ord='fro'):
+        """Return norms of latent variables. These can be used to monitor
+        convergence of the sampler.
+        """
+        monitor = ('U', 'V', 'lambda_u', 'lambda_v')
+        return self._norms(ord, monitor)
 
 
 class Baseline(object):
@@ -152,11 +293,10 @@ class Baseline(object):
 
     def __init__(self, train_data):
         """Simple heuristic-based transductive learning to fill in missing
-        values in data."""
+        values in data matrix."""
         self.predict(train_data.copy())
 
     def predict(self, train_data):
-        """Fill in missing values with global mean."""
         raise NotImplementedError(
             'baseline prediction not implemented for base class')
 
@@ -187,24 +327,24 @@ class GlobalMeanBaseline(Baseline):
 
 
 class MeanOfMeansBaseline(Baseline):
-    """Fill in missing values using mean of user/joke/global mean."""
+    """Fill in missing values using mean of user/item/global means."""
 
     def predict(self, train_data):
         nan_mask = np.isnan(train_data)
         masked_train = np.ma.masked_array(train_data, nan_mask)
         global_mean = masked_train.mean()
         user_means = masked_train.mean(axis=1)
-        joke_means = masked_train.mean(axis=0)
+        item_means = masked_train.mean(axis=0)
         self.predicted = train_data.copy()
         n, m = train_data.shape
         for i in xrange(n):
             for j in xrange(m):
-                if np.ma.isMA(joke_means[j]):
+                if np.ma.isMA(item_means[j]):
                     self.predicted[i,j] = np.mean(
                         (global_mean, user_means[i]))
                 else:
                     self.predicted[i,j] = np.mean(
-                        (global_mean, user_means[i], joke_means[j]))
+                        (global_mean, user_means[i], item_means[j]))
 
 
 def make_parser():
@@ -223,7 +363,8 @@ def make_parser():
         '-d', '--dimension', type=int, default=10,
         help='dimensionality of PMF model')
     parser.add_argument(
-        '-m', '--method', choices=('ur', 'gm', 'mom', 'pmf-map', 'pmf-mcmc'),
+        '-m', '--method',
+        choices=('ur', 'gm', 'mom', 'pmf-map', 'pmf-mcmc', 'bpmf'),
         default='pmf-map',
         help='method to use for making predictions')
     parser.add_argument(
@@ -265,18 +406,30 @@ if __name__ == "__main__":
             format='[%(asctime)s]: %(message)s')
 
     train, test = read_jester_data()  # read a subset of jester data
+    ratings_range = (-10, 10)
+
+    if args.method == 'bpmf':
+        bpmf = BPMF(data=train, scale=ratings_range, dim=args.dimension)
+        bpmf.build_model()
+        bpmf.find_map()
+
+        # Check RMSE for MAP estimate (same as PMF MAP.
+        print 'bpmf-map train RMSE: %.5f' % bpmf.map_rmse(train)
+        print 'bpmf-map test RMSE:  %.5f' % bpmf.map_rmse(test)
+
+        # Perform MCMC sampling -- may take a while.
+        bpmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose)
+        bpmf.predict(burn_in=args.burn_in)
+        print 'pmf-mcmc train rmse: %.5f' % bpmf.rmse(train)
+        print 'pmf-mcmc test rmse:  %.5f' % bpmf.rmse(test)
 
     if args.method.startswith('pmf'):
-        # Perform mean value imputation on train set for PMF use.
-        orig_train = train.copy()         # save a copy for eval later
-        train[np.isnan(train)] = train[~np.isnan(train)].mean()
-
-        pmf = PMF(data=train, scale=(-10, 10), dim=args.dimension)
+        pmf = PMF(data=train, scale=ratings_range, dim=args.dimension)
         pmf.build_model()
         pmf.find_map()
 
         # Check RMSE for MAP estimate
-        print 'pmf-map train RMSE: %.5f' % pmf.map_rmse(orig_train)
+        print 'pmf-map train RMSE: %.5f' % pmf.map_rmse(train)
         print 'pmf-map test RMSE:  %.5f' % pmf.map_rmse(test)
 
         if args.method == 'pmf-map':
@@ -285,7 +438,7 @@ if __name__ == "__main__":
         # Perform MCMC sampling -- may take a while.
         pmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose)
         pmf.predict(burn_in=args.burn_in)
-        print 'pmf-mcmc train rmse: %.5f' % pmf.rmse(orig_train)
+        print 'pmf-mcmc train rmse: %.5f' % pmf.rmse(train)
         print 'pmf-mcmc test rmse:  %.5f' % pmf.rmse(test)
 
     elif args.method == 'ur':
