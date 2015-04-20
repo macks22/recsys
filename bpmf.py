@@ -1,4 +1,5 @@
 import sys
+import time
 import logging
 import argparse
 
@@ -30,9 +31,7 @@ def rmse(test_data, predicted):
     data."""
     I = ~np.isnan(test_data)   # indicator for missing values
     N = I.sum()                # number of non-missing values
-    sqerror = abs(test_data - predicted) ** 2
-    mse = sqerror[I].sum() / N
-    return np.sqrt(mse)
+    return np.sqrt(((test_data - predicted) ** 2)[I].sum() / N)
 
 
 class Model(object):
@@ -63,24 +62,29 @@ class Model(object):
             self.find_map()
             return self._map
 
-    def find_map(self):
+    def find_map(self, verbose=False):
         """Use non-gradient based optimization to find MAP."""
+        tstart = time.time()
         with self.model:
-            logging.info('finding MAP using Powell optimization')
-            self._map = pm.find_MAP(fmin=sp.optimize.fmin_powell)
+            logging.info('finding MAP using Powell optimization...')
+            self._map = pm.find_MAP(fmin=sp.optimize.fmin_powell, disp=verbose)
+
+        elapsed = time.time() - tstart
+        logging.info('found MAP in %d seconds' % int(elapsed)
 
     @property
     def start(self):
         return self.map
 
-    def sample(self, n=100, njobs=4, progressbar=True):
+    def sample(self, n=100, njobs=4, progressbar=True, start=None, trace=None):
         """Draw n MCMC samples using the NUTS sampler."""
+        start = self.start if start is None else start
         with self.model:
             logging.info(
                 'drawing %d MCMC samples using %d jobs' % (n, njobs))
-            self.step = pm.NUTS(scaling=self.start)
-            self.trace = pm.sample(n, self.step, start=self.start, njobs=njobs,
-                                   progressbar=progressbar)
+            self.step = pm.NUTS(scaling=start)
+            self.trace = pm.sample(n, self.step, start=start, njobs=njobs,
+                                   progressbar=progressbar, trace=trace)
 
     def rmse(self, test_data):
         """Find root mean squared error on this model's predictions."""
@@ -104,20 +108,21 @@ class PMF(Model):
         # Mean value imputation
         nan_mask = np.isnan(self.data)
         self.data[nan_mask] = self.data[~nan_mask].mean()
+        assert(np.isnan(self.data).sum() == 0)
 
         # Low precision reflects uncertainty; prevents overfitting
         # Set to mean variance across users and items.
-        self.alpha_u = 1 / train.var(axis=1).mean()
-        self.alpha_v = 1 / train.var(axis=0).mean()
+        self.alpha_u = 1 / self.data.var(axis=1).mean()
+        self.alpha_v = 1 / self.data.var(axis=0).mean()
 
         # Use fixed precision for the likelihood function.
         self.alpha = alpha
 
     @property
     def std(self):
-        return np.sqrt(1 / self.alpha)
+        return np.sqrt(1. / self.alpha)
 
-    def build_model(self, std=0.5):
+    def build_model(self, std=0.01):
         """Construct the model using pymc3 (most of the work is done by theano).
         Note that the `testval` param for U and V initialize the model away from
         0 using a small amount of Gaussian noise, set by `std`.
@@ -128,10 +133,10 @@ class PMF(Model):
         logging.info('building the PMF model')
         with pm.Model() as pmf:
             U = pm.MvNormal(
-                'U', mu=0, tau=self.alpha_u,
+                'U', mu=0, tau=self.alpha_u * np.eye(dim),
                 shape=(n, dim), testval=np.random.randn(n, dim) * std)
             V = pm.MvNormal(
-                'V', mu=0, tau=self.alpha_v,
+                'V', mu=0, tau=self.alpha_v * np.eye(dim),
                 shape=(m, dim), testval=np.random.randn(m, dim) * std)
             R = pm.Normal(
                 'R', mu=theano.tensor.dot(U, V.T),
@@ -144,12 +149,11 @@ class PMF(Model):
     def estimate_R(self, U, V):
         R = np.dot(U, V.T)
         n, m = R.shape
-        sample_R = np.ndarray(R.shape)
-        for i in xrange(n):
-            for j in xrange(m):
-                sample_R[i,j] = stats.norm.rvs(R[i,j], self.std)
-
-        return sample_R
+        std = self.std  # cache value to avoid repeated lookup
+        return np.array([
+            [np.random.normal(R[i,j], std) for j in xrange(m)]
+            for i in xrange(n)
+        ])
 
     def map_rmse(self, test_data):
         sample_R = self.estimate_R(self.map['U'], self.map['V'])
@@ -173,7 +177,7 @@ class PMF(Model):
         self.predicted[self.predicted > high] = high
         return self.predicted
 
-    def running_rmse(self, test_data, burn_in=10, plot=True):
+    def running_rmse(self, test_data, burn_in=10, plot=False):
         """Calculate RMSE for each step of the trace to monitor convergence.
         Return a list of tuples with the first element being the per-sample
         RMSE, and the last being the running RMSE.
@@ -226,6 +230,7 @@ class PMF(Model):
             series = pd.Series(trace_norms[key])
             series.plot(kind='line', grid=False, title=title, ax=ax)
         fig.show()
+        return fig, axes
 
 
 class BPMF(PMF):
@@ -384,6 +389,9 @@ def make_parser():
         default='pmf-map',
         help='method to use for making predictions')
     parser.add_argument(
+        '-t', '--trace-backend', default=None,
+        help='type of backend to use for MCMC samples')
+    parser.add_argument(
         '-v', '--verbose', action='store_true',
         help='enable verbose logging')
     return parser
@@ -444,14 +452,15 @@ if __name__ == "__main__":
     if args.method == 'bpmf':
         bpmf = BPMF(data=train, scale=ratings_range, dim=args.dimension)
         bpmf.build_model()
-        bpmf.find_map()
+        bpmf.find_map(verbose=args.verbose)
 
         # Check RMSE for MAP estimate (same as PMF MAP.
         print 'bpmf-map train RMSE: %.5f' % bpmf.map_rmse(train)
         print 'bpmf-map test RMSE:  %.5f' % bpmf.map_rmse(test)
 
         # Perform MCMC sampling -- may take a while.
-        bpmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose)
+        bpmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose,
+                    trace=args.trace_backend)
         bpmf.predict(burn_in=args.burn_in)
         print 'pmf-mcmc train rmse: %.5f' % bpmf.rmse(train)
         print 'pmf-mcmc test rmse:  %.5f' % bpmf.rmse(test)
@@ -459,7 +468,7 @@ if __name__ == "__main__":
     if args.method.startswith('pmf'):
         pmf = PMF(data=train, scale=ratings_range, dim=args.dimension)
         pmf.build_model()
-        pmf.find_map()
+        pmf.find_map(verbose=args.verbose)
 
         # Check RMSE for MAP estimate
         print 'pmf-map train RMSE: %.5f' % pmf.map_rmse(train)
@@ -469,7 +478,8 @@ if __name__ == "__main__":
             sys.exit(0)
 
         # Perform MCMC sampling -- may take a while.
-        pmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose)
+        pmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose,
+                   trace=args.trace_backend)
         pmf.predict(burn_in=args.burn_in)
         print 'pmf-mcmc train rmse: %.5f' % pmf.rmse(train)
         print 'pmf-mcmc test rmse:  %.5f' % pmf.rmse(test)
