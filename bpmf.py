@@ -298,31 +298,39 @@ class BPMF(PMF):
         with pm.Model() as bpmf:
             # Specify user feature matrix
             sigma_u = pm.Uniform('sigma_u', shape=dim)
-            corr_triangle_u = pm.LKJCorr('corr_u', n=1, p=dim)
+            corr_triangle_u = pm.LKJCorr(
+                'corr_u', n=1, p=dim,
+                testval=np.random.randn(n_elem) * std)
+
             corr_matrix_u = corr_triangle_u[tri_index]
             corr_matrix_u = t.fill_diagonal(corr_matrix_u, 1)
-            cov_matrix = t.diag(sigma_u).dot(corr_matrix_u.dot(t.diag(sigma_u)))
+            cov_matrix_u = t.diag(sigma_u).dot(corr_matrix_u.dot(t.diag(sigma_u)))
+            lambda_u = t.nlinalg.matrix_inverse(cov_matrix_u)
 
             mu_u = pm.Normal(
                 'mu_u', mu=0, tau=beta_0 * lambda_u, shape=dim,
                  testval=np.random.randn(dim) * std)
             U = pm.MvNormal(
-                'U', mu=mu_u, tau=t.nlinalg.matrix_inverse(cov_matrix),
+                'U', mu=mu_u, tau=lambda_u,
                 shape=(n, dim), testval=np.random.randn(n, dim) * std)
 
             # Specify item feature matrix
             sigma_v = pm.Uniform('sigma_v', shape=dim)
-            corr_triangle_v = pm.LKJCorr('corr_v', n=1, p=dim)
+            corr_triangle_v = pm.LKJCorr(
+                'corr_v', n=1, p=dim,
+                testval=np.random.randn(n_elem) * std)
+
             corr_matrix_v = corr_triangle_v[tri_index]
             corr_matrix_v = t.fill_diagonal(corr_matrix_v, 1)
-            cov_matrix = t.diag(sigma_v).dot(corr_matrix_v.dot(t.diag(sigma_v)))
+            cov_matrix_v = t.diag(sigma_v).dot(corr_matrix_v.dot(t.diag(sigma_v)))
+            lambda_v = t.nlinalg.matrix_inverse(cov_matrix_v)
 
             mu_v = pm.Normal(
                 'mu_v', mu=0, tau=beta_0 * lambda_v, shape=dim,
                  testval=np.random.randn(dim) * std)
             V = pm.MvNormal(
-                'V', mu=mu_v, tau=t.nlinalg.matrix_inverse(cov_matrix),
-                testval=np.random.randn(m, dim) * std)
+                'V', mu=mu_v, tau=lambda_v,
+                shape=(m, dim), testval=np.random.randn(m, dim) * std)
 
             # Specify rating likelihood function
             R = pm.Normal(
