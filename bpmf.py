@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import logging
@@ -14,7 +15,6 @@ import pymc3 as pm
 import numpy as np
 import pandas as pd
 import scipy as sp
-import scipy.stats as stats
 import matplotlib.pyplot as plt
 
 
