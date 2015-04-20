@@ -105,21 +105,22 @@ class PMF(Model):
         nan_mask = np.isnan(self.data)
         self.data[nan_mask] = self.data[~nan_mask].mean()
 
-        # Set precision of U and V according to sample precision.
-        self.sample_precision = 1 / np.var(self.data)
-        self.alpha_u = self.alpha_v = self.sample_precision * np.eye(dim)
+        # Low precision reflects uncertainty; prevents overfitting
+        # Set to mean variance across users and items.
+        self.alpha_u = 1 / train.var(axis=1).mean()
+        self.alpha_v = 1 / train.var(axis=0).mean()
 
         # Use fixed precision for the likelihood function.
-        self.alpha = np.ones(self.data.shape) * alpha
+        self.alpha = alpha
 
     @property
     def std(self):
-        return np.sqrt(1 / self.alpha[0,0])
+        return np.sqrt(1 / self.alpha)
 
-    def build_model(self):
+    def build_model(self, std=0.5):
         """Construct the model using pymc3 (most of the work is done by theano).
         Note that the `testval` param for U and V initialize the model away from
-        0 using a small amount of Gaussian noise.
+        0 using a small amount of Gaussian noise, set by `std`.
         """
         n, m = self.data.shape
         dim = self.dim
@@ -128,12 +129,13 @@ class PMF(Model):
         with pm.Model() as pmf:
             U = pm.MvNormal(
                 'U', mu=0, tau=self.alpha_u,
-                shape=(n, dim), testval=np.random.randn(n, dim) * .01)
+                shape=(n, dim), testval=np.random.randn(n, dim) * std)
             V = pm.MvNormal(
                 'V', mu=0, tau=self.alpha_v,
-                shape=(m, dim), testval=np.random.randn(m, dim) * .01)
+                shape=(m, dim), testval=np.random.randn(m, dim) * std)
             R = pm.Normal(
-                'R', mu=theano.tensor.dot(U, V.T), tau=self.alpha,
+                'R', mu=theano.tensor.dot(U, V.T),
+                tau=self.alpha * np.ones(self.data.shape),
                 observed=self.data)
 
         logging.info('done building PMF model')
@@ -241,13 +243,12 @@ class BPMF(PMF):
         del self.__dict__['alpha_u']
         del self.__dict__['alpha_v']
 
-    def build_model(self):
+    def build_model(self, std=0.5):
         n, m = self.data.shape
         dim = self.dim
         beta_0 = 1  # scaling factor for lambdas; unclear on its use
 
         logging.info('building the BPMF model')
-        std = .05  # how much noise to use for model initialization
         with pm.Model() as bpmf:
             # Specify user feature matrix
             lambda_u = pm.Wishart(
