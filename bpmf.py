@@ -3,6 +3,11 @@ import time
 import logging
 import argparse
 
+try:
+    import ujson as json
+except ImportError:
+    import json
+
 import theano
 import pymc3 as pm
 import numpy as np
@@ -62,7 +67,7 @@ class Model(object):
             self.find_map()
             return self._map
 
-    def find_map(self, verbose=False):
+    def find_map(self, verbose=False, savedir=None):
         """Use non-gradient based optimization to find MAP."""
         tstart = time.time()
         with self.model:
@@ -70,7 +75,35 @@ class Model(object):
             self._map = pm.find_MAP(fmin=sp.optimize.fmin_powell, disp=verbose)
 
         elapsed = time.time() - tstart
-        logging.info('found MAP in %d seconds' % int(elapsed)
+        logging.info('found MAP in %d seconds' % int(elapsed))
+
+        if savedir:
+            self.save_map(savedir)
+
+    def save_map(self, savedir):
+        logging.info('writing MAP to directory: %s' % savedir)
+        os.mkdir(savedir)
+        shapes = {}
+        for varname in self.map:
+            data = self.map[varname]
+            var_file = os.path.join(savedir, varname + '.txt')
+            np.savetxt(var_file, data.reshape(-1, data.size))
+            shapes[varname] = data.shape
+
+            ## Store shape information for reloading.
+            shape_file = os.path.join(savedir, 'shapes.json')
+            with open(shape_file, 'w') as sfh:
+                json.dump(shapes, sfh)
+
+    def load_map(self, savedir):
+        shape_file = os.path.join(savedir, 'shapes.json')
+        with open(shape_file, 'r') as sfh:
+            shapes = json.load(sfh)
+
+        self._map = {}
+        for varname, shape in shapes.items():
+            var_file = os.path.join(savedir, varname + '.txt')
+            self._map[varname] = np.loadtxt(var_file).reshape(shape)
 
     @property
     def start(self):
@@ -108,7 +141,6 @@ class PMF(Model):
         # Mean value imputation
         nan_mask = np.isnan(self.data)
         self.data[nan_mask] = self.data[~nan_mask].mean()
-        assert(np.isnan(self.data).sum() == 0)
 
         # Low precision reflects uncertainty; prevents overfitting
         # Set to mean variance across users and items.
@@ -285,10 +317,11 @@ class BPMF(PMF):
         logging.info('done building the BPMF model')
         self._model = bpmf
 
-    def find_map(self):
+    def find_map(self, verbose=False, savedir=None):
         """Use the PMF map to initialize BPMF."""
         logging.info("Using PMF MAP to initialize BPMF")
         pmf = PMF(self.data, self.scale, dim=self.dim)
+        pmf.find_map(verbose, savedir)
         self._map = pmf.map
 
     @property
@@ -312,10 +345,10 @@ class BPMF(PMF):
 class Baseline(object):
     """Calculate baseline predictions."""
 
-    def __init__(self, train_data):
+    def __init__(self, data):
         """Simple heuristic-based transductive learning to fill in missing
         values in data matrix."""
-        self.predict(train_data.copy())
+        self.predict(data.copy())
 
     def predict(self, train_data):
         raise NotImplementedError(
@@ -372,10 +405,10 @@ def make_parser():
     parser = argparse.ArgumentParser(
         description='Probabilistic Matrix Factorization.')
     parser.add_argument(
-        '-n', '--njobs', type=int, default=4,
+        '-nj', '--njobs', type=int, default=4,
         help='number of processes to use for MCMC sampling')
     parser.add_argument(
-        '-s', '--samples', type=int, default=100,
+        '-ns', '--nsamples', type=int, default=100,
         help='number of MCMC samples to draw')
     parser.add_argument(
         '-b', '--burn-in', type=int, default=10,
@@ -389,8 +422,17 @@ def make_parser():
         default='pmf-map',
         help='method to use for making predictions')
     parser.add_argument(
-        '-t', '--trace-backend', default=None,
-        help='type of backend to use for MCMC samples')
+        '-st', '--save-trace', default=None,
+        help='directory to save MCMC trace to')
+    parser.add_argument(
+        '-lt', '--load-trace', default=None,
+        help='directory to load MCMC trace from')
+    parser.add_argument(
+        '-sm', '--save-map', default=None,
+        help='directory to save the MAP estimate to for {B}PMF')
+    parser.add_argument(
+        '-lm', '--load-map', default=None,
+        help='directory to load MAP estimate from for {B}PMF')
     parser.add_argument(
         '-v', '--verbose', action='store_true',
         help='enable verbose logging')
@@ -452,23 +494,36 @@ if __name__ == "__main__":
     if args.method == 'bpmf':
         bpmf = BPMF(data=train, scale=ratings_range, dim=args.dimension)
         bpmf.build_model()
-        bpmf.find_map(verbose=args.verbose)
+        if args.load_map:
+            bpmf.load_map(args.load_map)
+        else:
+            bpmf.find_map(verbose=args.verbose, savedir=args.save_map)
 
         # Check RMSE for MAP estimate (same as PMF MAP.
         print 'bpmf-map train RMSE: %.5f' % bpmf.map_rmse(train)
         print 'bpmf-map test RMSE:  %.5f' % bpmf.map_rmse(test)
 
         # Perform MCMC sampling -- may take a while.
-        bpmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose,
-                    trace=args.trace_backend)
-        bpmf.predict(burn_in=args.burn_in)
-        print 'pmf-mcmc train rmse: %.5f' % bpmf.rmse(train)
-        print 'pmf-mcmc test rmse:  %.5f' % bpmf.rmse(test)
+        if args.save_trace:
+            with bpmf.model:
+                backend = pm.backends.Text(args.save_trace)
+        else:
+            backend = None
 
-    if args.method.startswith('pmf'):
+        bpmf.sample(n=args.nsamples, njobs=args.njobs,
+                    progressbar=args.verbose,
+                    trace=backend)
+        bpmf.predict(burn_in=args.burn_in)
+        print 'bpmf-mcmc train rmse: %.5f' % bpmf.rmse(train)
+        print 'bpmf-mcmc test rmse:  %.5f' % bpmf.rmse(test)
+
+    elif args.method.startswith('pmf'):
         pmf = PMF(data=train, scale=ratings_range, dim=args.dimension)
         pmf.build_model()
-        pmf.find_map(verbose=args.verbose)
+        if args.load_map:
+            pmf.load_map(args.load_map)
+        else:
+            pmf.find_map(verbose=args.verbose, savedir=args.save_map)
 
         # Check RMSE for MAP estimate
         print 'pmf-map train RMSE: %.5f' % pmf.map_rmse(train)
@@ -478,8 +533,15 @@ if __name__ == "__main__":
             sys.exit(0)
 
         # Perform MCMC sampling -- may take a while.
-        pmf.sample(n=args.samples, njobs=args.njobs, progressbar=args.verbose,
-                   trace=args.trace_backend)
+        if args.save_trace:
+            with pmf.model:
+                backend = pm.backends.Text(args.save_trace)
+        else:
+            backend = None
+
+        pmf.sample(n=args.nsamples, njobs=args.njobs,
+                   progressbar=args.verbose,
+                   trace=backend)
         pmf.predict(burn_in=args.burn_in)
         print 'pmf-mcmc train rmse: %.5f' % pmf.rmse(train)
         print 'pmf-mcmc test rmse:  %.5f' % pmf.rmse(test)
