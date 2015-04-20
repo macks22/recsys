@@ -9,6 +9,7 @@ except ImportError:
     import json
 
 import theano
+import theano.tensor as t
 import pymc3 as pm
 import numpy as np
 import pandas as pd
@@ -280,39 +281,52 @@ class BPMF(PMF):
         del self.__dict__['alpha_u']
         del self.__dict__['alpha_v']
 
-    def build_model(self, std=0.5):
+    def build_model(self, std=0.01):
         n, m = self.data.shape
         dim = self.dim
         beta_0 = 1  # scaling factor for lambdas; unclear on its use
 
+        # We will use separate priors for sigma and correlation matrix.
+        # In order to convert the upper triangular correlation values to a
+        # complete correlation matrix, we need to construct an index matrix:
+        n_elem = dim * (dim - 1) / 2
+        tri_index = np.zeros([dim, dim], dtype=int)
+        tri_index[np.triu_indices(dim, k=1)] = np.arange(n_elem)
+        tri_index[np.triu_indices(dim, k=1)[::-1]] = np.arange(n_elem)
+
         logging.info('building the BPMF model')
         with pm.Model() as bpmf:
             # Specify user feature matrix
-            lambda_u = pm.Wishart(
-                'lambda_u', n=dim, V=np.eye(dim), shape=(dim, dim),
-                testval=np.random.randn(dim, dim) * std)
+            sigma_u = pm.Uniform('sigma_u', shape=dim)
+            corr_triangle_u = pm.LKJCorr('corr_u', n=1, p=dim)
+            corr_matrix_u = corr_triangle_u[tri_index]
+            corr_matrix_u = t.fill_diagonal(corr_matrix_u, 1)
+            cov_matrix = t.diag(sigma_u).dot(corr_matrix_u.dot(t.diag(sigma_u)))
+
             mu_u = pm.Normal(
                 'mu_u', mu=0, tau=beta_0 * lambda_u, shape=dim,
                  testval=np.random.randn(dim) * std)
             U = pm.MvNormal(
-                'U', mu=mu_u, tau=lambda_u, shape=(n, dim),
-                testval=np.random.randn(n, dim) * std)
+                'U', mu=mu_u, tau=t.nlinalg.matrix_inverse(cov_matrix),
+                shape=(n, dim), testval=np.random.randn(n, dim) * std)
 
             # Specify item feature matrix
-            lambda_v = pm.Wishart(
-                'lambda_v', n=dim, V=np.eye(dim), shape=(dim, dim),
-                testval=np.random.randn(dim, dim) * std)
+            sigma_v = pm.Uniform('sigma_v', shape=dim)
+            corr_triangle_v = pm.LKJCorr('corr_v', n=1, p=dim)
+            corr_matrix_v = corr_triangle_v[tri_index]
+            corr_matrix_v = t.fill_diagonal(corr_matrix_v, 1)
+            cov_matrix = t.diag(sigma_v).dot(corr_matrix_v.dot(t.diag(sigma_v)))
+
             mu_v = pm.Normal(
                 'mu_v', mu=0, tau=beta_0 * lambda_v, shape=dim,
                  testval=np.random.randn(dim) * std)
             V = pm.MvNormal(
-                'V', mu=mu_v, tau=lambda_v, shape=(m, dim),
+                'V', mu=mu_v, tau=t.nlinalg.matrix_inverse(cov_matrix),
                 testval=np.random.randn(m, dim) * std)
 
             # Specify rating likelihood function
             R = pm.Normal(
-                'R', mu=theano.tensor.dot(U, V.T), tau=self.alpha,
-                observed=self.data)
+                'R', mu=t.dot(U, V.T), tau=self.alpha, observed=self.data)
 
         logging.info('done building the BPMF model')
         self._model = bpmf
