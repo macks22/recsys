@@ -1,0 +1,3 @@
+A Joke 
+Q: How many programmers does it take to change a lightbulb?
+A: NONE!   That's a hardware problem....
