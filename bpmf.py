@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import scipy as sp
 import scipy.stats as stats
+import matplotlib.pyplot as plt
 
 
 def gen_data(n=50, m=20):
@@ -170,23 +171,34 @@ class PMF(Model):
         self.predicted[self.predicted > high] = high
         return self.predicted
 
-    def running_rmse(self, test_data, burn_in=10):
+    def running_rmse(self, test_data, burn_in=10, plot=True):
         """Calculate RMSE for each step of the trace to monitor convergence.
         Return a list of tuples with the first element being the per-sample
         RMSE, and the last being the running RMSE.
         """
         burn_in = burn_in if len(self.trace) >= burn_in else 0
-        results = []
+        results = {'per-step': [], 'running': []}
         R = np.zeros(self.data.shape)
         for cnt, sample in enumerate(self.trace[burn_in:]):
             sample_R = self.estimate_R(sample['U'], sample['V'])
             R += sample_R
             running_R = R / (cnt + 1)
-            results.append((rmse(test_data, sample_R),
-                            rmse(test_data, running_R)))
-        return results
+            results['per-step'].append(rmse(test_data, sample_R))
+            results['running'].append(rmse(test_data, running_R))
+
+        # Plot the results before returning
+        results = pd.DataFrame(results)
+        results.plot(
+            kind='line', grid=False, figsize=(16, 7),
+            title="Posterior Predictive Per-step and Running RMSE")
+
+        # Return the final predictions, and the RMSE calculations
+        return running_R, pd.DataFrame(results)
 
     def _norms(self, ord, monitor):
+        logging.info('calculating %s norms for model vars: %s' % (
+            ord, ','.join(monitor)))
+
         norms = {var: [] for var in monitor}
         for sample in self.trace:
             for var in monitor:
@@ -199,6 +211,19 @@ class PMF(Model):
         """
         monitor = ('U', 'V')
         return self._norms(ord, monitor)
+
+    def traceplot(self):
+        """Plot Frobenius norms of all variables in the trace."""
+        trace_norms = self.norms()
+        num_plots = len(trace_norms)
+        num_rows = int(np.ceil(num_plots / 2.))
+        fig, axes = plt.subplots(num_rows, 2)
+        for key, ax in zip(trace_norms, axes):
+            title = '$\|%s\|_{Fro}^2$ at Each Sample' % (
+                key if len(key) == 1 else '\%s' % key)
+            series = pd.Series(trace_norms[key])
+            series.plot(kind='line', grid=False, title=title, ax=ax)
+        fig.show()
 
 
 class BPMF(PMF):
@@ -269,16 +294,6 @@ class BPMF(PMF):
             if key not in start:
                 start[key] = point[key]
         return start
-
-    def _norms(self, ord, monitor):
-        logging.info('calculating %s norms for model vars: %s' % (
-            ord, ','.join(monitor)))
-
-        norms = {var: [] for var in monitor}
-        for sample in self.trace:
-            for var in monitor:
-                norms[var].append(np.linalg.norm(sample[var], ord))
-        return norms
 
     def norms(self, ord='fro'):
         """Return norms of latent variables. These can be used to monitor
@@ -373,7 +388,7 @@ def make_parser():
     return parser
 
 
-def read_jester_data(n=200, m=50):
+def read_jester_data(n=1000, m=100):
     """Read a subset of the dense 1000x100 jester dataset.
     :param int n: Number of users to keep.
     :param int m: Number of jokes to keep.
@@ -382,18 +397,35 @@ def read_jester_data(n=200, m=50):
     data = pd.read_csv('data/jester-dataset-v1-dense-first-1000.csv')
     data = data.head(n).ix[:,:m]  # get subset for model validation
 
+    # First we need to split up our data into a training set and a test set.
     logging.info('splitting train/test sets')
     n, m = data.shape           # # users, # jokes
-    test_size = m / 10          # use 10% of data as test set
-    train_size = m - test_size  # and remainder for training
+    N = n * m                   # # cells in matrix
+    test_size = N / 10          # use 10% of data as test set
+    train_size = N - test_size  # and remainder for training
 
-    train = data.copy()
-    train.ix[:,train_size:] = np.nan  # remove test data from train set
+    # Prepare train/test ndarrays.
+    train = data.copy().values
+    test = np.ones(data.shape) * np.nan
 
-    test = data.copy()
-    test.ix[:,:train_size] = np.nan  # remove train data from test set
+    # Draw random sample of training data to use for testing.
+    tosample = np.where(~np.isnan(train))
+    idx_pairs = zip(tosample[0], tosample[1])
+    indices = np.arange(len(idx_pairs))
+    sample = np.random.choice(indices, replace=False, size=test_size)
 
-    return train.values, test.values
+    # Transfer random sample from train set to test set.
+    for idx in sample:
+        idx_pair = idx_pairs[idx]
+        test[idx_pair] = train[idx_pair]  # transfer to test set
+        train[idx_pair] = np.nan          # remove from train set
+
+    # Verify everything worked properly
+    assert(np.isnan(train).sum() == test_size)
+    assert(np.isnan(test).sum() == train_size)
+
+    # Return the two numpy ndarrays
+    return train, test
 
 
 if __name__ == "__main__":
