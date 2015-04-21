@@ -308,7 +308,7 @@ class BPMF(PMF):
             lambda_u = t.nlinalg.matrix_inverse(cov_matrix_u)
 
             mu_u = pm.Normal(
-                'mu_u', mu=0, tau=beta_0 * lambda_u, shape=dim,
+                'mu_u', mu=0, tau=beta_0 * t.diag(lambda_u), shape=dim,
                  testval=np.random.randn(dim) * std)
             U = pm.MvNormal(
                 'U', mu=mu_u, tau=lambda_u,
@@ -326,7 +326,7 @@ class BPMF(PMF):
             lambda_v = t.nlinalg.matrix_inverse(cov_matrix_v)
 
             mu_v = pm.Normal(
-                'mu_v', mu=0, tau=beta_0 * lambda_v, shape=dim,
+                'mu_v', mu=0, tau=beta_0 * t.diag(lambda_v), shape=dim,
                  testval=np.random.randn(dim) * std)
             V = pm.MvNormal(
                 'V', mu=mu_v, tau=lambda_v,
@@ -360,7 +360,7 @@ class BPMF(PMF):
         """Return norms of latent variables. These can be used to monitor
         convergence of the sampler.
         """
-        monitor = ('U', 'V', 'lambda_u', 'lambda_v')
+        monitor = ('U', 'V', 'corr_u', 'corr_v', 'mu_u', 'mu_v')
         return self._norms(ord, monitor)
 
 
@@ -521,12 +521,15 @@ if __name__ == "__main__":
         else:
             bpmf.find_map(verbose=args.verbose, savedir=args.save_map)
 
-        # Check RMSE for MAP estimate (same as PMF MAP.
+        # Check RMSE for MAP estimate (same as PMF MAP).
         print 'bpmf-map train RMSE: %.5f' % bpmf.map_rmse(train)
         print 'bpmf-map test RMSE:  %.5f' % bpmf.map_rmse(test)
 
         # Perform MCMC sampling -- may take a while.
-        if args.save_trace:
+        if args.load_trace:
+            with bpmf.model:
+                backend = pm.backend.text.load(args.load_trace)
+        elif args.save_trace:
             with bpmf.model:
                 backend = pm.backends.Text(args.save_trace)
         else:
@@ -555,7 +558,10 @@ if __name__ == "__main__":
             sys.exit(0)
 
         # Perform MCMC sampling -- may take a while.
-        if args.save_trace:
+        if args.load_trace:
+            with pmf.model:
+                backend = pm.backend.text.load(args.load_trace)
+        elif args.save_trace:
             with pmf.model:
                 backend = pm.backends.Text(args.save_trace)
         else:
