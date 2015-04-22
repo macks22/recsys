@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import hashlib
 import logging
 import argparse
 
@@ -182,17 +183,19 @@ class PMF(Model):
     def estimate_R(self, U, V):
         R = np.dot(U, V.T)
         n, m = R.shape
-        std = self.std  # cache value to avoid repeated lookup
-        return np.array([
-            [np.random.normal(R[i,j], std) for j in xrange(m)]
+        sample_R = np.array([
+            [np.random.normal(R[i,j], self.std) for j in xrange(m)]
             for i in xrange(n)
         ])
 
-    def map_rmse(self, test_data):
-        sample_R = self.estimate_R(self.map['U'], self.map['V'])
+        # Bound predictions based on rating scale.
         low, high = self.scale
         sample_R[sample_R < low] = low
         sample_R[sample_R > high] = high
+        return sample_R
+
+    def map_rmse(self, test_data):
+        sample_R = self.estimate_R(self.map['U'], self.map['V'])
         return rmse(test_data, sample_R)
 
     def predict(self, burn_in=0):
@@ -205,9 +208,6 @@ class PMF(Model):
             self.predicted += self.estimate_R(sample['U'], sample['V'])
 
         self.predicted /= len(self.trace[burn_in:])
-        low, high = self.scale
-        self.predicted[self.predicted < low] = low
-        self.predicted[self.predicted > high] = high
         return self.predicted
 
     def running_rmse(self, test_data, burn_in=10, plot=False):
@@ -232,7 +232,7 @@ class PMF(Model):
             title="Posterior Predictive Per-step and Running RMSE")
 
         # Return the final predictions, and the RMSE calculations
-        return running_R, pd.DataFrame(results)
+        return running_R, results
 
     def _norms(self, ord, monitor):
         logging.info('calculating %s norms for model vars: %s' % (
@@ -387,9 +387,9 @@ class UniformRandomBaseline(Baseline):
     def predict(self, train_data):
         nan_mask = np.isnan(train_data)
         masked_train = np.ma.masked_array(train_data, nan_mask)
-        min, max = masked_train.min(), masked_train.max()
+        dmin, dmax = masked_train.min(), masked_train.max()
         N = nan_mask.sum()
-        train_data[nan_mask] = np.random.uniform(min, max, N)
+        train_data[nan_mask] = np.random.uniform(dmin, dmax, N)
         self.predicted = train_data
 
 
@@ -497,8 +497,14 @@ def read_jester_data(n=1000, m=100):
     assert(np.isnan(train).sum() == test_size)
     assert(np.isnan(test).sum() == train_size)
 
+    # Finally, hash the indices and save the train/test sets.
+    index_string = ''.join(map(str, np.sort(sample)))
+    name = hashlib.sha1(index_string).hexdigest()
+    savedir = os.path.join('data', name)
+    save_np_vars({'train': train, 'test': test}, savedir)
+
     # Return the two numpy ndarrays
-    return train, test
+    return train, test, name
 
 
 if __name__ == "__main__":
@@ -510,7 +516,8 @@ if __name__ == "__main__":
             level=logging.INFO,
             format='[%(asctime)s]: %(message)s')
 
-    train, test = read_jester_data()  # read a subset of jester data
+    train, test, name = read_jester_data()  # read a subset of jester data
+    logging.info('saved train/test split to %s:' % name
     ratings_range = (-10, 10)
 
     if args.method == 'bpmf':
