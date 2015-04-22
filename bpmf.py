@@ -138,6 +138,9 @@ class Model(object):
             self.trace = pm.sample(n, self.step, start=start, njobs=njobs,
                                    progressbar=progressbar, trace=trace)
 
+    def load_trace(self, savedir):
+        self.trace = pm.backends.text.load(savedir)
+
     def rmse(self, test_data):
         """Find root mean squared error on this model's predictions."""
         return rmse(test_data, self.predicted)
@@ -251,22 +254,22 @@ class PMF(Model):
         # Return the final predictions, and the RMSE calculations
         return running_R, results
 
-    def _norms(self, ord, monitor):
-        logging.info('calculating %s norms for model vars: %s' % (
-            ord, ','.join(monitor)))
+    def _norms(self, monitor):
+        logging.info('calculating Frobenius norms for model vars: %s' % (
+            ','.join(monitor)))
 
         norms = {var: [] for var in monitor}
         for sample in self.trace:
             for var in monitor:
-                norms[var].append(np.linalg.norm(sample[var], ord))
+                norms[var].append(np.linalg.norm(sample[var]))
         return norms
 
-    def norms(self, ord='fro'):
+    def norms(self):
         """Return norms of latent variables. These can be used to monitor
         convergence of the sampler.
         """
         monitor = ('U', 'V')
-        return self._norms(ord, monitor)
+        return self._norms(monitor)
 
     def traceplot(self):
         """Plot Frobenius norms of all variables in the trace."""
@@ -274,9 +277,8 @@ class PMF(Model):
         num_plots = len(trace_norms)
         num_rows = int(np.ceil(num_plots / 2.))
         fig, axes = plt.subplots(num_rows, 2)
-        for key, ax in zip(trace_norms, axes):
-            title = '$\|%s\|_{Fro}^2$ at Each Sample' % (
-                key if len(key) == 1 else '\%s' % key)
+        for key, ax in zip(trace_norms, axes.flat):
+            title = '$\|%s\|_{Fro}^2$ at Each Sample' % key
             series = pd.Series(trace_norms[key])
             series.plot(kind='line', grid=False, title=title, ax=ax)
         fig.show()
@@ -373,12 +375,12 @@ class BPMF(PMF):
                 start[key] = point[key]
         return start
 
-    def norms(self, ord='fro'):
+    def norms(self):
         """Return norms of latent variables. These can be used to monitor
         convergence of the sampler.
         """
         monitor = ('U', 'V', 'corr_u', 'corr_v', 'mu_u', 'mu_v')
-        return self._norms(ord, monitor)
+        return self._norms(monitor)
 
 
 class Baseline(object):
@@ -522,6 +524,13 @@ def read_jester_data(n=1000, m=100):
 
     # Return the two numpy ndarrays
     return train, test, name
+
+
+def load_train_test(name):
+    """Load the train/test sets."""
+    savedir = os.path.join('data', name)
+    vars = load_np_vars(savedir)
+    return vars['train'], vars['test']
 
 
 if __name__ == "__main__":
