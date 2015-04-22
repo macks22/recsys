@@ -41,6 +41,41 @@ def rmse(test_data, predicted):
     return np.sqrt(((test_data - predicted) ** 2)[I].sum() / N)
 
 
+# We adapt these from `pymc3`'s `backends` module, where the original
+# code is used to save the traces from MCMC samples.
+def save_np_vars(vars, savedir):
+    """Save a dictionary of numpy variables to `savedir`. We assume
+    the directory does not exist; an OSError will be raised if it does.
+    """
+    logging.info('writing numpy vars to directory: %s' % savedir)
+    os.mkdir(savedir)
+    shapes = {}
+    for varname in vars:
+        data = vars[varname]
+        var_file = os.path.join(savedir, varname + '.txt')
+        np.savetxt(var_file, data.reshape(-1, data.size))
+        shapes[varname] = data.shape
+
+        ## Store shape information for reloading.
+        shape_file = os.path.join(savedir, 'shapes.json')
+        with open(shape_file, 'w') as sfh:
+            json.dump(shapes, sfh)
+
+
+def load_np_vars(savedir):
+    """Load numpy variables saved with `save_np_vars`."""
+    shape_file = os.path.join(savedir, 'shapes.json')
+    with open(shape_file, 'r') as sfh:
+        shapes = json.load(sfh)
+
+    vars = {}
+    for varname, shape in shapes.items():
+        var_file = os.path.join(savedir, varname + '.txt')
+        vars[varname] = np.loadtxt(var_file).reshape(shape)
+
+    return vars
+
+
 class Model(object):
     """Base class for PyMC model wrappers."""
 
@@ -84,28 +119,10 @@ class Model(object):
 
     def save_map(self, savedir):
         logging.info('writing MAP to directory: %s' % savedir)
-        os.mkdir(savedir)
-        shapes = {}
-        for varname in self.map:
-            data = self.map[varname]
-            var_file = os.path.join(savedir, varname + '.txt')
-            np.savetxt(var_file, data.reshape(-1, data.size))
-            shapes[varname] = data.shape
-
-            ## Store shape information for reloading.
-            shape_file = os.path.join(savedir, 'shapes.json')
-            with open(shape_file, 'w') as sfh:
-                json.dump(shapes, sfh)
+        save_np_vars(self.map, savedir)
 
     def load_map(self, savedir):
-        shape_file = os.path.join(savedir, 'shapes.json')
-        with open(shape_file, 'r') as sfh:
-            shapes = json.load(sfh)
-
-        self._map = {}
-        for varname, shape in shapes.items():
-            var_file = os.path.join(savedir, varname + '.txt')
-            self._map[varname] = np.loadtxt(var_file).reshape(shape)
+        self._map = load_np_vars(savedir)
 
     @property
     def start(self):
@@ -517,7 +534,7 @@ if __name__ == "__main__":
             format='[%(asctime)s]: %(message)s')
 
     train, test, name = read_jester_data()  # read a subset of jester data
-    logging.info('saved train/test split to %s:' % name
+    logging.info('saved train/test split to %s:' % name)
     ratings_range = (-10, 10)
 
     if args.method == 'bpmf':
